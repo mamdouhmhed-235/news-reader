@@ -7,5 +7,10 @@
     "server:install": "cd server && npm install",
     "server:dev": "cd server && npm run dev",
     "web:dev": "cd web && npm run dev"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
   }
 }
