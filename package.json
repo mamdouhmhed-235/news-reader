@@ -1,0 +1,11 @@
+{
+  "name": "news-reader",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm run server:dev & npm run web:dev",
+    "server:install": "cd server && npm install",
+    "server:dev": "cd server && npm run dev",
+    "web:dev": "cd web && npm run dev"
+  }
+}
