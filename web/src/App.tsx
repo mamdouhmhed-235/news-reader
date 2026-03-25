@@ -69,6 +69,9 @@ export default function App() {
   const cacheRef = useRef<Map<number, NewsResponse>>(new Map());
   const seenUuidsRef = useRef<Set<string>>(new Set());
   const categorySwitchRef = useRef(false);
+  const pendingRef = useRef<Set<number>>(new Set());
+  const rateLimitedUntilRef = useRef(0);
+  const fetchIdRef = useRef(0);
 
   const debouncedSearch = useDebounce(searchInput, 300);
   const themes = getAvailableThemes();
@@ -92,7 +95,7 @@ export default function App() {
   // Theme init
   useEffect(() => { applyTheme(theme); }, []);
 
-  // Debounced search — skip during category switches to avoid race condition
+  // Debounced search — skip during category switches
   useEffect(() => {
     if (categorySwitchRef.current) return;
     const trimmed = debouncedSearch.trim();
@@ -110,54 +113,101 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [retryCountdown]);
 
-  // Core: fetch a single page from API
+  // Core: fetch a single page from API with deduplication and cooldown
   const fetchSinglePage = useCallback(async (pg: number, cat: string, query: string): Promise<NewsResponse | null> => {
+    // Check 429 cooldown
+    if (Date.now() < rateLimitedUntilRef.current) {
+      return null;
+    }
+
     if (!navigator.onLine) {
       setError("You are offline. Please check your internet connection.");
       setRetryable(true);
       setLoading(false);
       return null;
     }
+
     const cached = cacheRef.current.get(pg);
     if (cached) return cached;
+
+    // Deduplicate: don't fetch if already in flight
+    if (pendingRef.current.has(pg)) return null;
+
+    const fetchId = ++fetchIdRef.current;
+    pendingRef.current.add(pg);
 
     try {
       const params: Record<string, string | number> = { page: pg };
       if (query) params.search = query;
       else params.categories = cat;
       const data = await fetchNews(params);
+
+      // Only apply result if this is still the latest fetch
+      if (fetchId !== fetchIdRef.current) return null;
+
       cacheRef.current.set(pg, data);
       return data;
     } catch (err: unknown) {
+      // Only apply error if this is still the latest fetch
+      if (fetchId !== fetchIdRef.current) return null;
+
       const msg = err instanceof Error ? err.message : "Failed to load news";
+      const is429 = err instanceof Error && (err.message.includes("429") || err.message.includes("limit"));
+      if (is429) {
+        setErrorCode(429);
+        // Block further requests for 15 seconds after rate limit
+        rateLimitedUntilRef.current = Date.now() + 15000;
+      } else {
+        setErrorCode(null);
+      }
       setError(msg);
       setRetryable(true);
-      setErrorCode(err instanceof Error && err.message.includes("429") ? 429 : null);
       return null;
+    } finally {
+      pendingRef.current.delete(pg);
     }
   }, []);
 
-  // Pager mode: load a single page, replace articles
-  const loadPagerPage = useCallback(async (pg: number) => {
-    setLoading(true);
-    setError(null);
-    setErrorCode(null);
-    setRetryable(false);
+  // Pager mode: load a single page, replace articles (only sets error on non-prefetch calls)
+  const loadPagerPage = useCallback(async (pg: number, isPrefetch = false) => {
+    // Don't clear error state during 429 cooldown
+    if (!isPrefetch) {
+      if (Date.now() < rateLimitedUntilRef.current) {
+        setError("Daily request limit reached. Please wait a moment and try again.");
+        setErrorCode(429);
+        setRetryable(true);
+        setRetryCountdown(Math.ceil((rateLimitedUntilRef.current - Date.now()) / 1000));
+        return;
+      }
+      setLoading(true);
+      setError(null);
+      setErrorCode(null);
+      setRetryable(false);
+    }
     const data = await fetchSinglePage(pg, activeCat, search);
     if (data) {
       setAllArticles(data.data);
       setPageArticles(data.data);
       setHasMore(pg * data.meta.limit < data.meta.found);
     }
-    setLoading(false);
+    if (!isPrefetch) setLoading(false);
   }, [activeCat, search, fetchSinglePage]);
 
   // Feed mode: load a page and append to allArticles
-  const loadFeedPage = useCallback(async (pg: number) => {
-    if (!loading) setLoading(pg === 1);
-    setError(null);
-    setErrorCode(null);
-    setRetryable(false);
+  const loadFeedPage = useCallback(async (pg: number, isPrefetch = false) => {
+    if (!isPrefetch) {
+      if (Date.now() < rateLimitedUntilRef.current) {
+        setError("Daily request limit reached. Please wait a moment and try again.");
+        setErrorCode(429);
+        setRetryable(true);
+        setRetryCountdown(Math.ceil((rateLimitedUntilRef.current - Date.now()) / 1000));
+        return;
+      }
+      if (pg === 1) setLoading(true);
+      setError(null);
+      setErrorCode(null);
+      setRetryable(false);
+    }
     const data = await fetchSinglePage(pg, activeCat, search);
     if (data) {
       const newArticles = data.data.filter(a => !seenUuidsRef.current.has(a.uuid));
@@ -171,8 +221,8 @@ export default function App() {
       }
       setHasMore(pg * data.meta.limit < data.meta.found);
     }
-    if (pg === 1) setLoading(false);
-  }, [activeCat, search, fetchSinglePage, loading]);
+    if (!isPrefetch && pg === 1) setLoading(false);
+  }, [activeCat, search, fetchSinglePage]);
 
   // Initial load and on category/search change
   useEffect(() => {
@@ -183,7 +233,14 @@ export default function App() {
     setHasMore(true);
     seenUuidsRef.current.clear();
     cacheRef.current.clear();
-    setError(null);
+    pendingRef.current.clear();
+    fetchIdRef.current++;
+    // Don't clear error if we're rate limited
+    if (Date.now() >= rateLimitedUntilRef.current) {
+      setError(null);
+      setErrorCode(null);
+      setRetryable(false);
+    }
     if (viewMode === "pager") {
       loadPagerPage(1);
     } else {
@@ -191,45 +248,47 @@ export default function App() {
     }
   }, [category, search, useMyFeed, viewMode, loadPagerPage, loadFeedPage]);
 
-  // Prefetch for pager mode
+  // Prefetch for pager mode — only prefetch, don't overwrite error state
   useEffect(() => {
     if (viewMode !== "pager" || viewFavorites) return;
     if (articleIndex === 1 && pageArticles.length >= 2) {
       const next = page + 1;
-      if (!cacheRef.current.has(next)) {
+      if (!cacheRef.current.has(next) && !pendingRef.current.has(next)) {
         fetchSinglePage(next, activeCat, search).catch(() => {});
       }
     }
-  }, [articleIndex, page, activeCat, search, viewMode, viewFavorites, pageArticles.length, fetchSinglePage]);
+  }, [articleIndex]);
 
   useEffect(() => {
     if (viewMode !== "pager" || viewFavorites) return;
     if (articleIndex === 0 && page > 1) {
       const prev = page - 1;
-      if (!cacheRef.current.has(prev)) {
+      if (!cacheRef.current.has(prev) && !pendingRef.current.has(prev)) {
         fetchSinglePage(prev, activeCat, search).catch(() => {});
       }
     }
-  }, [articleIndex, page, activeCat, search, viewMode, viewFavorites, fetchSinglePage]);
+  }, [articleIndex, page]);
 
   const handleRetry = () => {
+    rateLimitedUntilRef.current = 0;
     if (viewMode === "pager") loadPagerPage(page);
     else loadFeedPage(page);
   };
 
   const handleCategoryChange = (cat: string) => {
     categorySwitchRef.current = true;
+    rateLimitedUntilRef.current = 0; // Reset cooldown on explicit user action
     setViewFavorites(false);
     setUseMyFeed(false);
     setSearch("");
     setSearchInput("");
     setCategory(cat);
-    // Allow debounced search to resume after state settles
     setTimeout(() => { categorySwitchRef.current = false; }, 400);
   };
 
   const handleMyFeed = () => {
     categorySwitchRef.current = true;
+    rateLimitedUntilRef.current = 0;
     setViewFavorites(false);
     setUseMyFeed(true);
     setSearch("");

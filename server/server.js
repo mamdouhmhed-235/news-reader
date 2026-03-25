@@ -39,7 +39,7 @@ function setCache(key, data) {
 // ===== Rate limiter =====
 const rateLimits = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
-const RATE_LIMIT_MAX = 30;
+const RATE_LIMIT_MAX = 60;
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -51,6 +51,13 @@ function isRateLimited(ip) {
   }
   entry.count++;
   return entry.count > RATE_LIMIT_MAX;
+}
+
+// ===== Pending request deduplication =====
+const pendingRequests = new Map();
+
+function getDedupKey(params) {
+  return `${params.page || ""}|${params.categories || ""}|${params.search || ""}`;
 }
 
 // Clean up old rate limit entries periodically
@@ -126,6 +133,18 @@ app.get("/api/news/all", async (req, res) => {
     return res.json(cached);
   }
 
+  // Deduplicate in-flight requests
+  const dedupKey = getDedupKey(req.query);
+  if (pendingRequests.has(dedupKey)) {
+    console.log(`Dedup: waiting for ${dedupKey}`);
+    try {
+      const result = await pendingRequests.get(dedupKey);
+      return res.json(result);
+    } catch {
+      return res.status(502).json({ error: "Upstream request failed" });
+    }
+  }
+
   const params = new URLSearchParams();
   params.set("language", "en");
   params.set("limit", "3");
@@ -137,23 +156,46 @@ app.get("/api/news/all", async (req, res) => {
 
   const url = `https://api.thenewsapi.com/v1/news/all?${params.toString()}`;
 
-  try {
-    console.log(
-      `Proxying: /v1/news/all?page=${page || 1}&categories=${categories || ""}&search=${search || ""}`
-    );
-    const response = await fetchWithRetry(url);
-    const data = await response.json();
+  const requestPromise = (async () => {
+    try {
+      console.log(
+        `Proxying: /v1/news/all?page=${page || 1}&categories=${categories || ""}&search=${search || ""}`
+      );
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
 
-    if (!response.ok) {
-      console.error(`TheNewsApi error: ${response.status}`);
-      return res.status(response.status).json(data);
+      if (!response.ok) {
+        console.error(`TheNewsApi error: ${response.status}`);
+        if (response.status === 429) {
+          const err429 = new Error("Daily request limit reached. Please try again later.");
+          err429.status = 429;
+          throw err429;
+        }
+        const apiErr = new Error(data?.error || `API error ${response.status}`);
+        apiErr.status = response.status;
+        throw apiErr;
+      }
+
+      setCache(cacheKey, data);
+      return data;
+    } catch (err) {
+      if (err.status) throw err;
+      console.error("Proxy error:", err.message);
+      const networkErr = new Error("Failed to fetch news after retries");
+      networkErr.status = 502;
+      throw networkErr;
     }
+  })();
 
-    setCache(cacheKey, data);
+  pendingRequests.set(dedupKey, requestPromise);
+
+  try {
+    const data = await requestPromise;
     res.json(data);
   } catch (err) {
-    console.error("Proxy error:", err.message);
-    res.status(502).json({ error: "Failed to fetch news after retries" });
+    res.status(err.status || 502).json({ error: err.message });
+  } finally {
+    pendingRequests.delete(dedupKey);
   }
 });
 
